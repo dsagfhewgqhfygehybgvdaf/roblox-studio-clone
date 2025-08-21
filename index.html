@@ -1,0 +1,430 @@
+import React, { useMemo, useRef, useState, useEffect } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { OrbitControls, TransformControls, Html, Grid } from "@react-three/drei";
+
+// --- Tiny helpers -----------------------------------------------------------
+const uid = () => Math.random().toString(36).slice(2, 9);
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+
+// A very tiny scene store (no external state lib)
+function useScene() {
+  const [objects, setObjects] = useState([]); // {id, type, pos:[x,y,z], rot:[x,y,z], scl:[x,y,z], color}
+  const [selectedId, setSelected] = useState(null);
+  const [mode, setMode] = useState("translate"); // translate | rotate | scale
+
+  const selected = useMemo(
+    () => objects.find(o => o.id === selectedId) || null,
+    [objects, selectedId]
+  );
+
+  const add = (type = "cube") => {
+    const id = uid();
+    const base = {
+      id,
+      type,
+      pos: [0, 0.5, 0],
+      rot: [0, 0, 0],
+      scl: [1, 1, 1],
+      color: type === "cube" ? "#22c55e" : "#60a5fa",
+      name: `${type}-${id}`,
+    };
+    setObjects(prev => [...prev, base]);
+    setSelected(id);
+  };
+
+  const remove = (id) => {
+    setObjects(prev => prev.filter(o => o.id !== id));
+    setSelected(s => (s === id ? null : s));
+  };
+
+  const update = (id, partial) => {
+    setObjects(prev => prev.map(o => (o.id === id ? { ...o, ...partial } : o)));
+  };
+
+  const clear = () => {
+    setObjects([]);
+    setSelected(null);
+  };
+
+  // localStorage persistence
+  useEffect(() => {
+    const saved = localStorage.getItem("mini-studio-scene");
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) setObjects(parsed);
+      } catch {}
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("mini-studio-scene", JSON.stringify(objects));
+  }, [objects]);
+
+  return { objects, selected, selectedId, setSelected, add, remove, update, clear, mode, setMode };
+}
+
+// --- 3D Pieces --------------------------------------------------------------
+function Selectable({ object, isSelected, onSelect, onChange }) {
+  const ref = useRef();
+
+  // Push transform changes back into state (from TransformControls)
+  const pushBack = () => {
+    const p = ref.current.position;
+    const r = ref.current.rotation;
+    const s = ref.current.scale;
+    onChange(object.id, {
+      pos: [p.x, p.y, p.z],
+      rot: [r.x, r.y, r.z],
+      scl: [s.x, s.y, s.z],
+    });
+  };
+
+  const meshProps = {
+    ref,
+    position: object.pos,
+    rotation: object.rot,
+    scale: object.scl,
+    onClick: (e) => {
+      e.stopPropagation();
+      onSelect(object.id);
+    },
+  };
+
+  const geometry =
+    object.type === "cube" ? (
+      <boxGeometry args={[1, 1, 1]} />
+    ) : object.type === "sphere" ? (
+      <sphereGeometry args={[0.5, 32, 32]} />
+    ) : (
+      <cylinderGeometry args={[0.5, 0.5, 1, 24]} />
+    );
+
+  const mesh = (
+    <mesh {...meshProps} castShadow receiveShadow>
+      {geometry}
+      <meshStandardMaterial color={object.color} />
+      {/* Name tag */}
+      <Html distanceFactor={10} occlude style={{ pointerEvents: "none" }}>
+        <div className="text-xs px-1 py-0.5 rounded bg-black/60 text-white">
+          {object.name}
+        </div>
+      </Html>
+    </mesh>
+  );
+
+  return isSelected ? (
+    <TransformControls
+      object={ref}
+      mode={"translate"}
+      onMouseUp={pushBack}
+    >
+      {mesh}
+    </TransformControls>
+  ) : (
+    mesh
+  );
+}
+
+function Lights() {
+  return (
+    <>
+      <ambientLight intensity={0.6} />
+      <directionalLight position={[5, 10, 5]} intensity={0.8} castShadow />
+    </>
+  );
+}
+
+function Ground() {
+  return (
+    <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+      <planeGeometry args={[200, 200]} />
+      <meshStandardMaterial color="#1f2937" />
+    </mesh>
+  );
+}
+
+// --- Mini scripting engine --------------------------------------------------
+/**
+ * Language: each line is one command
+ *
+ * spawn <cube|sphere|cylinder> x y z [color]
+ * move <name|id> x y z
+ * rotate <name|id> rx ry rz        (degrees)
+ * scale <name|id> sx sy sz
+ * color <name|id> #hex
+ * delete <name|id>
+ * name <name|id> newName
+ */
+function runScript(text, api) {
+  const lines = text.split(/\n+/);
+  const results = [];
+  for (let raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const [cmd, ...rest] = line.split(/\s+/);
+    try {
+      switch (cmd?.toLowerCase()) {
+        case "spawn": {
+          const [type = "cube", x = 0, y = 0.5, z = 0, color] = rest;
+          const id = api.add(type.toLowerCase());
+          api.update(id, {
+            pos: [parseFloat(x), parseFloat(y), parseFloat(z)],
+            color: color || undefined,
+          });
+          results.push(`spawned ${type} as ${id}`);
+          break;
+        }
+        case "move": {
+          const [target, x, y, z] = rest;
+          const id = api.resolve(target);
+          api.update(id, { pos: [parseFloat(x), parseFloat(y), parseFloat(z)] });
+          results.push(`moved ${target}`);
+          break;
+        }
+        case "rotate": {
+          const [target, rx, ry, rz] = rest;
+          const id = api.resolve(target);
+          const toRad = (d) => (parseFloat(d) * Math.PI) / 180;
+          api.update(id, { rot: [toRad(rx), toRad(ry), toRad(rz)] });
+          results.push(`rotated ${target}`);
+          break;
+        }
+        case "scale": {
+          const [target, sx, sy, sz] = rest;
+          const id = api.resolve(target);
+          api.update(id, { scl: [parseFloat(sx), parseFloat(sy), parseFloat(sz)] });
+          results.push(`scaled ${target}`);
+          break;
+        }
+        case "color": {
+          const [target, col] = rest;
+          const id = api.resolve(target);
+          api.update(id, { color: col });
+          results.push(`colored ${target}`);
+          break;
+        }
+        case "delete": {
+          const [target] = rest;
+          const id = api.resolve(target);
+          api.remove(id);
+          results.push(`deleted ${target}`);
+          break;
+        }
+        case "name": {
+          const [target, ...newNameArr] = rest;
+          const id = api.resolve(target);
+          const newName = newNameArr.join(" ");
+          api.update(id, { name: newName });
+          results.push(`renamed ${target} -> ${newName}`);
+          break;
+        }
+        default:
+          throw new Error(`Unknown command: ${cmd}`);
+      }
+    } catch (e) {
+      results.push(`Error @ "${line}": ${e.message}`);
+    }
+  }
+  return results.join("\n");
+}
+
+// --- UI ---------------------------------------------------------------------
+function RightPanel({ scene, editor, setEditor }) {
+  const { objects, selected, selectedId, setSelected, add, remove, update, clear, mode, setMode } = scene;
+
+  const resolve = (token) => {
+    if (!token) throw new Error("missing id/name");
+    const byId = objects.find(o => o.id === token);
+    if (byId) return byId.id;
+    const byName = objects.find(o => (o.name || "").toLowerCase() === token.toLowerCase());
+    if (byName) return byName.id;
+    throw new Error(`no object matches "${token}"`);
+  };
+
+  const api = { add, remove, update, resolve };
+
+  const onRun = () => {
+    const out = runScript(editor, api);
+    alert(out || "No output");
+  };
+
+  const exportJSON = () => {
+    const blob = new Blob([JSON.stringify(objects, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "scene.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importJSON = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!Array.isArray(data)) throw new Error("Bad file");
+        // naive load: overwrite scene
+        scene.clear();
+        setTimeout(() => {
+          data.forEach(d => scene.add(d.type));
+          // second pass to preserve props
+          scene.setSelected(null);
+          scene.setMode("translate");
+        }, 0);
+      } catch (e) {
+        alert("Import failed: " + e.message);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  return (
+    <div className="w-full lg:w-96 p-3 space-y-3 bg-white/70 backdrop-blur rounded-2xl shadow-xl border border-slate-200">
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-bold">Toolbox</h2>
+        <div className="text-xs text-slate-500">Mini Studio</div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2">
+        <button onClick={() => scene.add("cube")} className="px-3 py-2 rounded-2xl shadow bg-emerald-500 text-white hover:opacity-90">+ Cube</button>
+        <button onClick={() => scene.add("sphere")} className="px-3 py-2 rounded-2xl shadow bg-sky-500 text-white hover:opacity-90">+ Sphere</button>
+        <button onClick={() => scene.add("cylinder")} className="px-3 py-2 rounded-2xl shadow bg-amber-500 text-white hover:opacity-90">+ Cylinder</button>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <span className="text-sm">Gizmo:</span>
+        {(["translate", "rotate", "scale"]).map(m => (
+          <button
+            key={m}
+            onClick={() => scene.setMode(m)}
+            className={`px-3 py-1 rounded-full text-sm border ${mode===m?"bg-slate-900 text-white":"bg-white"}`}
+          >{m}</button>
+        ))}
+      </div>
+
+      <div className="space-y-2">
+        <div className="text-sm font-semibold">Selected</div>
+        {selected ? (
+          <div className="space-y-2 p-2 rounded-xl bg-slate-50 border">
+            <div className="text-sm">{selected.name} <span className="text-xs text-slate-500">({selected.id})</span></div>
+            <label className="text-xs text-slate-600">Color</label>
+            <input
+              type="color"
+              className="w-full h-9 rounded"
+              value={selected.color}
+              onChange={e => scene.update(selected.id, { color: e.target.value })}
+            />
+            <button onClick={() => scene.remove(selected.id)} className="w-full px-3 py-2 rounded-xl bg-rose-500 text-white shadow">Delete</button>
+          </div>
+        ) : (
+          <div className="p-2 rounded-xl bg-slate-50 border text-sm">Click an object in the scene to select it.</div>
+        )}
+      </div>
+
+      <div className="space-y-2">
+        <div className="text-sm font-semibold">Code (baby-simple)</div>
+        <textarea
+          className="w-full h-40 p-2 rounded-xl border font-mono text-sm"
+          spellCheck={false}
+          value={editor}
+          onChange={e => setEditor(e.target.value)}
+        />
+        <div className="flex gap-2">
+          <button onClick={onRun} className="px-3 py-2 rounded-xl bg-indigo-600 text-white shadow">Run Script</button>
+          <button onClick={() => setEditor(exampleScript)} className="px-3 py-2 rounded-xl bg-slate-200">Load Example</button>
+        </div>
+      </div>
+
+      <div className="flex gap-2 pt-2 border-t">
+        <button onClick={exportJSON} className="px-3 py-2 rounded-xl bg-slate-900 text-white">Export</button>
+        <label className="px-3 py-2 rounded-xl bg-slate-100 border cursor-pointer">Import
+          <input type="file" accept="application/json" className="hidden" onChange={e => e.target.files?.[0] && importJSON(e.target.files[0])} />
+        </label>
+        <button onClick={scene.clear} className="ml-auto px-3 py-2 rounded-xl bg-white border">Clear</button>
+      </div>
+
+      <div className="text-[10px] text-slate-500">
+        Tip: click ground to deselect. Hold right mouse to orbit, scroll to zoom. WASD to pan with OrbitControls (Q/E up/down).
+      </div>
+    </div>
+  );
+}
+
+function SceneView({ scene }) {
+  const { objects, selectedId, setSelected, update, mode } = scene;
+  const [size, setSize] = useState(1);
+
+  // Keyboard helpers (very light): delete removes selected
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Delete" && scene.selectedId) scene.remove(scene.selectedId);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [scene]);
+
+  return (
+    <div className="relative w-full h-[70vh] rounded-2xl overflow-hidden border bg-slate-900">
+      <Canvas shadows camera={{ position: [6, 6, 8], fov: 50 }}>
+        <Lights />
+        <Grid args={[50, 50]} cellColor="#334155" sectionColor="#475569" infiniteGrid />
+        <Ground />
+
+        <group onPointerMissed={(e) => { if (e.type === "pointerdown") setSelected(null); }}>
+          {objects.map((o) => (
+            <Selectable
+              key={o.id}
+              object={o}
+              isSelected={selectedId === o.id}
+              onSelect={setSelected}
+              onChange={update}
+            />
+          ))}
+        </group>
+
+        <OrbitControls makeDefault enableDamping />
+      </Canvas>
+
+      <div className="absolute top-2 left-2 px-2 py-1 text-xs rounded bg-black/60 text-white">
+        Mode: {mode}
+      </div>
+    </div>
+  );
+}
+
+const exampleScript = `# Example script — one command per line
+spawn cube 0 0.5 0 #22c55e
+spawn sphere 2 1 0 #60a5fa
+name cube-1 GreenBoi
+move GreenBoi 0 1 0
+rotate GreenBoi 0 45 0
+scale GreenBoi 2 0.5 2
+color GreenBoi #10b981
+`;
+
+export default function MiniRobloxStyleStudio() {
+  const scene = useScene();
+  const [editor, setEditor] = useState(exampleScript);
+
+  return (
+    <div className="min-h-screen w-full bg-gradient-to-br from-slate-50 to-slate-200 text-slate-900">
+      <div className="max-w-7xl mx-auto p-4 md:p-6">
+        <header className="flex items-center justify-between mb-4">
+          <h1 className="text-2xl md:text-3xl font-black tracking-tight">🧱 Mini Roblox-Style Studio</h1>
+          <div className="text-xs md:text-sm text-slate-500">Build blocks + baby scripts</div>
+        </header>
+
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr,26rem] gap-4 items-start">
+          <SceneView scene={scene} />
+          <RightPanel scene={scene} editor={editor} setEditor={setEditor} />
+        </div>
+
+        <footer className="mt-6 text-xs text-slate-500">
+          Commands: <code className="font-mono">spawn/move/rotate/scale/color/delete/name</code>. Example: <code className="font-mono">spawn cube 0 0.5 0 #ff0000</code>
+        </footer>
+      </div>
+    </div>
+  );
+}
